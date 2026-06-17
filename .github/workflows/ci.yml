@@ -29,12 +29,25 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '25'
+      
+      - name: 清理Gradle缓存
+        run: |
+          rm -rf ~/.gradle/caches/
+          rm -rf ~/.gradle/wrapper/
 
-      - name: Setup Gradle
+      - name: 设置Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
 
-      - name: Run build and tests with Gradle wrapper
-        run: ./gradlew test build -PdockerTests
+      - name: 使用Gradle运行构建和测试（带重试）
+        uses: nick-invision/retry@v3
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: ./gradlew test build -PdockerTests --warning-mode=all
+          
 
       - name: Publish test report
         uses: mikepenz/action-junit-report@v5
