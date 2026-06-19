@@ -1,0 +1,196 @@
+name: Release platform version builds
+
+on:
+  push:
+    branches:
+      - feat/folia
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform to build'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - bukkit
+          - bungee
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    name: Detect changed platform versions
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed versions
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          extract_bukkit_version() {
+            local ref="$1"
+            git ls-tree -r --name-only "$ref" -- bukkit 2>/dev/null \
+              | grep -E '\.gradle$' \
+              | while read -r file; do git show "${ref}:${file}"; done \
+              | sed -nE "s/.*dev\.folia:folia-api:([^']+).*/\1/p" \
+              | head -n1 || true
+          }
+
+          extract_bungee_version() {
+            local ref="$1"
+            git ls-tree -r --name-only "$ref" -- bungee 2>/dev/null \
+              | grep -E '\.gradle$' \
+              | while read -r file; do git show "${ref}:${file}"; done \
+              | sed -nE "s/.*net\.md-5:bungeecord-api:([^']+).*/\1/p" \
+              | head -n1 || true
+          }
+
+          add_entry() {
+            local platform="$1"
+            local display_name="$2"
+            local version="$3"
+            local tag="$4"
+            local task="$5"
+            local jar_glob="$6"
+
+            jq -nc \
+              --arg platform "$platform" \
+              --arg display_name "$display_name" \
+              --arg version "$version" \
+              --arg tag "$tag" \
+              --arg task "$task" \
+              --arg jar_glob "$jar_glob" \
+              '{platform: $platform, display_name: $display_name, version: $version, tag: $tag, task: $task, jar_glob: $jar_glob}'
+          }
+
+          entries=()
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            requested="${{ inputs.platform }}"
+
+            if [[ "$requested" == "all" || "$requested" == "bukkit" ]]; then
+              version="$(extract_bukkit_version HEAD)"
+              if [[ -n "$version" ]]; then
+                entries+=("$(add_entry "bukkit" "Bukkit/Folia" "$version" "bukkit-folia-$version" ":bukkit:loader:shadowJar" "bukkit/loader/build/libs/LuckPerms-Bukkit-*.jar")")
+              fi
+            fi
+
+            if [[ "$requested" == "all" || "$requested" == "bungee" ]]; then
+              version="$(extract_bungee_version HEAD)"
+              if [[ -n "$version" ]]; then
+                entries+=("$(add_entry "bungee" "BungeeCord" "$version" "bungee-$version" ":bungee:loader:shadowJar" "bungee/loader/build/libs/LuckPerms-Bungee-*.jar")")
+              fi
+            fi
+          else
+            before="${{ github.event.before }}"
+            after="${{ github.sha }}"
+
+            if [[ "$before" =~ ^0+$ ]] || ! git cat-file -e "$before^{commit}" 2>/dev/null; then
+              before="$(git rev-parse "${after}^")"
+            fi
+
+            changed_files="$(git diff --name-only "$before" "$after")"
+
+            if grep -qE '^bukkit/' <<< "$changed_files"; then
+              previous="$(extract_bukkit_version "$before")"
+              current="$(extract_bukkit_version "$after")"
+
+              if [[ -n "$current" && "$current" != "$previous" ]]; then
+                entries+=("$(add_entry "bukkit" "Bukkit/Folia" "$current" "bukkit-folia-$current" ":bukkit:loader:shadowJar" "bukkit/loader/build/libs/LuckPerms-Bukkit-*.jar")")
+              fi
+            fi
+
+            if grep -qE '^bungee/' <<< "$changed_files"; then
+              previous="$(extract_bungee_version "$before")"
+              current="$(extract_bungee_version "$after")"
+
+              if [[ -n "$current" && "$current" != "$previous" ]]; then
+                entries+=("$(add_entry "bungee" "BungeeCord" "$current" "bungee-$current" ":bungee:loader:shadowJar" "bungee/loader/build/libs/LuckPerms-Bungee-*.jar")")
+              fi
+            fi
+          fi
+
+          if [[ "${#entries[@]}" -eq 0 ]]; then
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+            echo 'has_changes=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf '%s\n' "${entries[@]}" | jq -sc '{include: .}' > matrix.json
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+          echo 'has_changes=true' >> "$GITHUB_OUTPUT"
+
+  build-and-release:
+    name: Build and release ${{ matrix.display_name }} ${{ matrix.version }}
+    needs: detect
+    if: needs.detect.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build ${{ matrix.display_name }}
+        run: ./gradlew ${{ matrix.task }}
+
+      - name: Collect release artifact
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          jars=(${{ matrix.jar_glob }})
+
+          if [[ "${#jars[@]}" -ne 1 ]]; then
+            printf 'Expected exactly one jar for %s, found %s\n' "${{ matrix.platform }}" "${#jars[@]}" >&2
+            printf '%s\n' "${jars[@]}" >&2
+            exit 1
+          fi
+
+          mkdir -p release
+          cp "${jars[0]}" "release/${{ matrix.platform }}-${{ matrix.version }}-${jars[0]##*/}"
+          echo "path=release/${{ matrix.platform }}-${{ matrix.version }}-${jars[0]##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ matrix.tag }}
+          RELEASE_NAME: LuckPerms ${{ matrix.display_name }} ${{ matrix.version }}
+          ARTIFACT_PATH: ${{ steps.artifact.outputs.path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ARTIFACT_PATH" --clobber
+          else
+            gh release create "$TAG" "$ARTIFACT_PATH" \
+              --title "$RELEASE_NAME" \
+              --notes "Automatischer Build fuer ${{ matrix.display_name }} API-Version ${{ matrix.version }}."
+          fi
